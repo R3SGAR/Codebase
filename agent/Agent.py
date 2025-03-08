@@ -22,9 +22,8 @@ class Agent(Base_Agent):
         self.fat_proxy_cmd = "" if is_fat_proxy else None
         self.fat_proxy_walk = np.zeros(3) # filtered walk parameters for fat proxy
 
-        self.init_pos = ([-14,0],[-9,-5],[-9,0],[-9,5],[-5,-5],[-5,0],[-5,5],[-1,-6],[-1,-2.5],[-1,2.5],[-1,6])[unum-1] # initial formation
-
-
+        self.init_pos = ([-14,0],[-7,-7],[-10,-3],[-7,7],[-10,3],[-11,0],[-5,-3],[-3,-0],[-1,-3],[-1,3],[-5,3])[unum-1] # initial formation
+        
     def beam(self, avoid_center_circle=False):
         r = self.world.robot
         pos = self.init_pos[:] # copy position list 
@@ -119,121 +118,162 @@ class Agent(Base_Agent):
         else: # fat proxy behavior
             return self.fat_proxy_kick()
 
-
-
+    
 
     def think_and_send(self):
-        w = self.world
-        r = self.world.robot  
-        my_head_pos_2d = r.loc_head_position[:2]
-        my_ori = r.imu_torso_orientation
-        ball_2d = w.ball_abs_pos[:2]
-        ball_vec = ball_2d - my_head_pos_2d
-        ball_dir = M.vector_angle(ball_vec)
-        ball_dist = np.linalg.norm(ball_vec)
-        ball_sq_dist = ball_dist * ball_dist # for faster comparisons
-        ball_speed = np.linalg.norm(w.get_ball_abs_vel(6)[:2])
-        behavior = self.behavior
-        goal_dir = M.target_abs_angle(ball_2d,(15.05,0))
-        path_draw_options = self.path_manager.draw_options
-        PM = w.play_mode
-        PM_GROUP = w.play_mode_group
+            w = self.world
+            r = self.world.robot  
+            my_head_pos_2d = r.loc_head_position[:2]
+            my_ori = r.imu_torso_orientation
+            ball_2d = w.ball_abs_pos[:2]
+            ball_vec = ball_2d - my_head_pos_2d
+            ball_dir = M.vector_angle(ball_vec)
+            ball_dist = np.linalg.norm(ball_vec)
+            ball_sq_dist = ball_dist * ball_dist # for faster comparisons
+            ball_speed = np.linalg.norm(w.get_ball_abs_vel(6)[:2])
+            behavior = self.behavior
+            goal_dir = M.target_abs_angle(ball_2d,(15.05,0))
+            path_draw_options = self.path_manager.draw_options
+            PM = w.play_mode
+            PM_GROUP = w.play_mode_group
 
-        #--------------------------------------- 1. Preprocessing
+            #--------------------------------------- 1. Preprocessing
 
-        slow_ball_pos = w.get_predicted_ball_pos(0.5) # predicted future 2D ball position when ball speed <= 0.5 m/s
+            
+            slow_ball_pos = w.get_predicted_ball_pos(0.5) # predicted future 2D ball position when ball speed <= 0.5 m/s
 
-        # list of squared distances between teammates (including self) and slow ball (sq distance is set to 1000 in some conditions)
-        teammates_ball_sq_dist = [np.sum((p.state_abs_pos[:2] - slow_ball_pos) ** 2)  # squared distance between teammate and ball
-                                  if p.state_last_update != 0 and (w.time_local_ms - p.state_last_update <= 360 or p.is_self) and not p.state_fallen
-                                  else 1000 # force large distance if teammate does not exist, or its state info is not recent (360 ms), or it has fallen
-                                  for p in w.teammates ]
+            # Define a default position for players without information (used to avoid errors)
+            default_pos = np.array([1000, 1000])
 
-        # list of squared distances between opponents and slow ball (sq distance is set to 1000 in some conditions)
-        opponents_ball_sq_dist = [np.sum((p.state_abs_pos[:2] - slow_ball_pos) ** 2)  # squared distance between teammate and ball
-                                  if p.state_last_update != 0 and w.time_local_ms - p.state_last_update <= 360 and not p.state_fallen
-                                  else 1000 # force large distance if opponent does not exist, or its state info is not recent (360 ms), or it has fallen
-                                  for p in w.opponents ]
+            # --- Vectorization for teammates ---
+            # Extract positions: if state_abs_pos is None, use default_pos
+            teammate_positions = np.array([
+                np.array(p.state_abs_pos[:2]) if p.state_abs_pos is not None else default_pos
+                for p in w.teammates
+            ])
+            # Extract other attributes with checks to avoid None values
+            teammate_last_updates = np.array([
+                p.state_last_update if p.state_last_update is not None else 0
+                for p in w.teammates
+            ])
+            teammate_is_self = np.array([p.is_self for p in w.teammates])
+            teammate_fallen = np.array([p.state_fallen for p in w.teammates])
+            # Include in the mask that the position is also valid
+            valid_mask = (
+                (teammate_last_updates != 0) &
+                (((w.time_local_ms - teammate_last_updates) <= 360) | teammate_is_self) &
+                (~teammate_fallen) &
+                (np.array([p.state_abs_pos is not None for p in w.teammates]))
+            )
+            # Compute the differences and the squared norm
+            diff_teammates = teammate_positions - slow_ball_pos
+            sq_distances_teammates = np.sum(diff_teammates**2, axis=1)
+            # Assign a large value (1000) to players with invalid data
+            sq_distances_teammates[~valid_mask] = 1000
+            teammates_ball_sq_dist = sq_distances_teammates.tolist()
 
-        min_teammate_ball_sq_dist = min(teammates_ball_sq_dist)
-        self.min_teammate_ball_dist = math.sqrt(min_teammate_ball_sq_dist)   # distance between ball and closest teammate
-        self.min_opponent_ball_dist = math.sqrt(min(opponents_ball_sq_dist)) # distance between ball and closest opponent
+            # --- Vectorization for opponents --- 
+            opponent_positions = np.array([
+                np.array(p.state_abs_pos[:2]) if p.state_abs_pos is not None else default_pos
+                for p in w.opponents
+            ])
+            opponent_last_updates = np.array([
+                p.state_last_update if p.state_last_update is not None else 0
+                for p in w.opponents
+            ])
+            opponent_fallen = np.array([p.state_fallen for p in w.opponents])
+            valid_mask_opponents = (
+                (opponent_last_updates != 0) &
+                ((w.time_local_ms - opponent_last_updates) <= 360) &
+                (~opponent_fallen) &
+                (np.array([p.state_abs_pos is not None for p in w.opponents]))
+            )
+            diff_opponents = opponent_positions - slow_ball_pos
+            sq_distances_opponents = np.sum(diff_opponents**2, axis=1)
+            sq_distances_opponents[~valid_mask_opponents] = 1000
+            opponents_ball_sq_dist = sq_distances_opponents.tolist()
 
-        active_player_unum = teammates_ball_sq_dist.index(min_teammate_ball_sq_dist) + 1
+            # Calculate minimum distances
+            min_teammate_ball_sq_dist = np.min(teammates_ball_sq_dist)
+            self.min_teammate_ball_dist = math.sqrt(min_teammate_ball_sq_dist)
+            self.min_opponent_ball_dist = math.sqrt(np.min(opponents_ball_sq_dist))
 
 
-        #--------------------------------------- 2. Decide action
+            active_player_unum = teammates_ball_sq_dist.index(min_teammate_ball_sq_dist) + 1
+
+
+            #--------------------------------------- 2. Decide action
 
 
 
-        if PM == w.M_GAME_OVER:
-            pass
-        elif PM_GROUP == w.MG_ACTIVE_BEAM:
-            self.beam()
-        elif PM_GROUP == w.MG_PASSIVE_BEAM:
-            self.beam(True) # avoid center circle
-        elif self.state == 1 or (behavior.is_ready("Get_Up") and self.fat_proxy_cmd is None):
-            self.state = 0 if behavior.execute("Get_Up") else 1 # return to normal state if get up behavior has finished
-        elif PM == w.M_OUR_KICKOFF:
-            if r.unum == 9:
-                self.kick(120,3) # no need to change the state when PM is not Play On
-            else:
+            if PM == w.M_GAME_OVER:
+                pass
+            elif PM_GROUP == w.MG_ACTIVE_BEAM:
+                self.beam()
+            elif PM_GROUP == w.MG_PASSIVE_BEAM:
+                self.beam(True) # avoid center circle
+            elif self.state == 1 or (behavior.is_ready("Get_Up") and self.fat_proxy_cmd is None):
+                self.state = 0 if behavior.execute("Get_Up") else 1 # return to normal state if get up behavior has finished
+            elif PM == w.M_OUR_KICKOFF:
+                if r.unum == 9:
+                    self.kick(120,3) # no need to change the state when PM is not Play On
+                else:
+                    self.move(self.init_pos, orientation=ball_dir) # walk in place
+            elif PM == w.M_THEIR_KICKOFF:
                 self.move(self.init_pos, orientation=ball_dir) # walk in place
-        elif PM == w.M_THEIR_KICKOFF:
-            self.move(self.init_pos, orientation=ball_dir) # walk in place
-        elif active_player_unum != r.unum: # I am not the active player
-            if r.unum == 1: # I am the goalkeeper
-                self.move(self.init_pos, orientation=ball_dir) # walk in place 
-            else:
-                # compute basic formation position based on ball position
-                new_x = max(0.5,(ball_2d[0]+15)/15) * (self.init_pos[0]+15) - 15
-                if self.min_teammate_ball_dist < self.min_opponent_ball_dist:
-                    new_x = min(new_x + 3.5, 13) # advance if team has possession
-                self.move((new_x,self.init_pos[1]), orientation=ball_dir, priority_unums=[active_player_unum])
+            elif active_player_unum != r.unum: # I am not the active player
+                if r.unum == 1: # I am the goalkeeper
+                    self.move(self.init_pos, orientation=ball_dir) # walk in place 
+                else:
+                    # compute basic formation position based on ball position
+                    new_x = max(0.5,(ball_2d[0]+15)/15) * (self.init_pos[0]+15) - 15
+                    if self.min_teammate_ball_dist < self.min_opponent_ball_dist:
+                        new_x = min(new_x + 3.5, 13) # advance if team has possession
+                    self.move((new_x,self.init_pos[1]), orientation=ball_dir, priority_unums=[active_player_unum])
 
-        else: # I am the active player
-            path_draw_options(enable_obstacles=True, enable_path=True, use_team_drawing_channel=True) # enable path drawings for active player (ignored if self.enable_draw is False)
-            enable_pass_command = (PM == w.M_PLAY_ON and ball_2d[0]<6)
+            else: # I am the active player
+                path_draw_options(enable_obstacles=True, enable_path=True, use_team_drawing_channel=True) # enable path drawings for active player (ignored if self.enable_draw is False)
+                enable_pass_command = (PM == w.M_PLAY_ON and ball_2d[0]<6)
 
-            if r.unum == 1 and PM_GROUP == w.MG_THEIR_KICK: # goalkeeper during their kick
-                self.move(self.init_pos, orientation=ball_dir) # walk in place 
-            if PM == w.M_OUR_CORNER_KICK:
-                self.kick( -np.sign(ball_2d[1])*95, 5.5) # kick the ball into the space in front of the opponent's goal
-                # no need to change the state when PM is not Play On
-            elif self.min_opponent_ball_dist + 0.5 < self.min_teammate_ball_dist: # defend if opponent is considerably closer to the ball
-                if self.state == 2: # commit to kick while aborting
-                    self.state = 0 if self.kick(abort=True) else 2
-                else: # move towards ball, but position myself between ball and our goal
-                    self.move(slow_ball_pos + M.normalize_vec((-16,0) - slow_ball_pos) * 0.2, is_aggressive=True)
-            else:
-                self.state = 0 if self.kick(goal_dir,9,False,enable_pass_command) else 2
+                if r.unum == 1 and PM_GROUP == w.MG_THEIR_KICK: # goalkeeper during their kick
+                    self.move(self.init_pos, orientation=ball_dir) # walk in place 
+                if PM == w.M_OUR_CORNER_KICK:
+                    self.kick( -np.sign(ball_2d[1])*95, 5.5) # kick the ball into the space in front of the opponent's goal
+                    # no need to change the state when PM is not Play On
+                elif self.min_opponent_ball_dist + 0.5 < self.min_teammate_ball_dist: # defend if opponent is considerably closer to the ball
+                    if self.state == 2: # commit to kick while aborting
+                        self.state = 0 if self.kick(abort=True) else 2
+                    else: # move towards ball, but position myself between ball and our goal
+                        self.move(slow_ball_pos + M.normalize_vec((-16,0) - slow_ball_pos) * 0.2, is_aggressive=True)
+                else:
+                    self.state = 0 if self.kick(goal_dir,9,False,enable_pass_command) else 2
 
-            path_draw_options(enable_obstacles=False, enable_path=False) # disable path drawings
+                path_draw_options(enable_obstacles=False, enable_path=False) # disable path drawings
 
-        #--------------------------------------- 3. Broadcast
-        self.radio.broadcast()
+            #--------------------------------------- 3. Broadcast
+            self.radio.broadcast()
 
-        #--------------------------------------- 4. Send to server
-        if self.fat_proxy_cmd is None: # normal behavior
-            self.scom.commit_and_send( r.get_command() )
-        else: # fat proxy behavior
-            self.scom.commit_and_send( self.fat_proxy_cmd.encode() ) 
-            self.fat_proxy_cmd = ""
+            #--------------------------------------- 4. Send to server
+            if self.fat_proxy_cmd is None: # normal behavior
+                self.scom.commit_and_send( r.get_command() )
+            else: # fat proxy behavior
+                self.scom.commit_and_send( self.fat_proxy_cmd.encode() ) 
+                self.fat_proxy_cmd = ""
 
-        #---------------------- annotations for debugging
-        if self.enable_draw: 
-            d = w.draw
-            if active_player_unum == r.unum:
-                d.point(slow_ball_pos, 3, d.Color.pink, "status", False) # predicted future 2D ball position when ball speed <= 0.5 m/s
-                d.point(w.ball_2d_pred_pos[-1], 5, d.Color.pink, "status", False) # last ball prediction
-                d.annotation((*my_head_pos_2d, 0.6), "I've got it!" , d.Color.yellow, "status")
-            else:
-                d.clear("status")
+            #---------------------- annotations for debugging
+            if self.enable_draw: 
+                d = w.draw
+                if active_player_unum == r.unum:
+                    d.point(slow_ball_pos, 3, d.Color.pink, "status", False) # predicted future 2D ball position when ball speed <= 0.5 m/s
+                    d.point(w.ball_2d_pred_pos[-1], 5, d.Color.pink, "status", False) # last ball prediction
+                    d.annotation((*my_head_pos_2d, 0.6), "I've got it!" , d.Color.yellow, "status")
+                else:
+                    d.clear("status")
 
 
 
 
-    #--------------------------------------- Fat proxy auxiliary methods
+        #--------------------------------------- Fat proxy auxiliary methods
 
 
     def fat_proxy_kick(self):
@@ -250,7 +290,6 @@ class Agent(Base_Agent):
         else:
             self.fat_proxy_move(ball_2d-(-0.1,0), None, True) # ignore obstacles
             return False
-
 
     def fat_proxy_move(self, target_2d, orientation, is_orientation_absolute):
         r = self.world.robot
